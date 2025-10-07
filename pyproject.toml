@@ -6,12 +6,13 @@ authors = [
     {name = "Rebeca Feitosa Matias",email = "rebecafeitosamatias@gmail.com"}
 ]
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = "<3.14,>=3.10,"
 dependencies = [
     "black (>=25.9.0,<26.0.0)",
     "isort (>=6.1.0,<7.0.0)",
     "pre-commit (>=4.3.0,<5.0.0)",
-    "flake8 (>=7.3.0,<8.0.0)"
+    "flake8 (>=7.3.0,<8.0.0)",
+    "apache-airflow[postgress] (>=3.1.0,<4.0.0)"
 ]
 
 
