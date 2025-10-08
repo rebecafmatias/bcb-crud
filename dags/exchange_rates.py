@@ -1,5 +1,6 @@
 import logging
-from datetime import datetime
+import os
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -23,8 +24,12 @@ dag = DAG(
 # Extracting data
 
 
-def extract(ds_nodash: str, **_):
-    base_url = "https://www.bcb.gov.br/Download/fechamento/"
+def extract(**context):
+    ds = context["ds"]
+    ds_nodash = (datetime.strptime(ds, "%Y-%m-%d") - timedelta(days=2)).strftime(
+        "%Y%m%d"
+    )
+    base_url = "https://www4.bcb.gov.br/Download/fechamento/"
     full_url = f"{base_url}{ds_nodash}.csv"
     logging.info(f"Downloading file from {full_url}")
 
@@ -34,30 +39,39 @@ def extract(ds_nodash: str, **_):
             f"BCB status={response.status_code}, bytes={len(response.content)}"
         )
         if response.status_code != 200 or not response.content:
-            return None
-        elif response.status_code == 200:
-            csv_data = response.content.decode("utf-8")
-            temp_dir = Path("/usr/local/airflow/tmp")
-            temp_dir.mkdir(parents=True, exist_ok=True)
+            result = None
+            logging.info(f"Resultado extração: {result}")
+            return result
 
-            file_path = temp_dir / f"exchange_rates_{ds_nodash}.csv"
-            file_path.write_text(csv_data, encoding="utf-8")
+        ctype = (response.headers.get("Content-Type") or "").lower()
+        snippet = (
+            response.content[:200].decode("utf-8", errors="ignore").lstrip().lower()
+        )
+        logging.info(f"Content-Type: {ctype}")
+        logging.info(f"Snippet:\n{snippet}")
 
-            logging.info(f"File saved at {file_path}")
+        csv_data = response.content.decode("utf-8")
+        temp_dir = Path("/usr/local/airflow/tmp")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        file_path = temp_dir / f"exchange_rates_{ds_nodash}.csv"
+        file_path.write_text(csv_data, encoding="utf-8")
 
-            return str(file_path)
-        else:
-            logging.warning(f"Request failed: status {response.status_code}")
-            return None
+        logging.info(f"File saved at {file_path}")
+
+        result = str(file_path)
+        logging.info(f"Resultado extração: {result}")
+        return result
+
     except Exception as e:
         logging.error(e)
-        return None
+        result = None
+        logging.info(f"Resultado extração: {result}")
+        return result
 
 
 extract_task = PythonOperator(
     task_id="extract",
     python_callable=extract,
-    op_kwargs={"ds_nodash": "{{ macros.ds_add(ds, -1) | replace('-', '') }}"},
     dag=dag,
 )
 
@@ -108,6 +122,8 @@ def transform(ti, **_):
 
     df["dat_process"] = datetime.now()
 
+    logging.info(df.head(5))
+
     tmp_dir = Path("/usr/local/airflow/tmp")
     tmp_dir.mkdir(parents=True, exist_ok=True)
     processed_path = tmp_dir / f"{Path(raw_path).stem}_processed.csv"
@@ -146,46 +162,58 @@ create_table_postgres = SQLExecuteQueryOperator(
 # Loading data into postgres table
 
 
-def load(**kwargs):
-    process_path = kwargs["ti"].xcom_pull(task_id="transform")
+def load(ti, **_):
+    process_path = ti.xcom_pull(task_ids="transform")
     if not process_path:
         raise ValueError("No csv path found.")
 
-    table_name = "fact_exchange_rates"
-
     fact_exchange_rates_df = pd.read_csv(process_path, parse_dates=["DT_FECHAMENTO"])
+    df = fact_exchange_rates_df.rename(
+        columns={
+            "DT_FECHAMENTO": "dt_fechamento",
+            "COD_MOEDA": "cod_moeda",
+            "TIPO_MOEDA": "tipo_moeda",
+            "DESC_MOEDA": "desc_moeda",
+            "TAXA_COMPRA": "taxa_compra",
+            "TAXA_VENDA": "taxa_venda",
+            "PARIDADE_COMPRA": "paridade_compra",
+            "PARIDADE_VENDA": "paridade_venda",
+            "dat_process": "dat_process",
+        }
+    )
+
+    df["dt_fechamento"] = pd.to_datetime(df["dt_fechamento"])
 
     cols = [
-        "DT_FECHAMENTO",
-        "COD_MOEDA",
-        "TIPO_MOEDA",
-        "DESC_MOEDA",
-        "TAXA_COMPRA",
-        "TAXA_VENDA",
-        "PARIDADE_COMPRA",
-        "PARIDADE_VENDA",
+        "dt_fechamento",
+        "cod_moeda",
+        "tipo_moeda",
+        "desc_moeda",
+        "taxa_compra",
+        "taxa_venda",
+        "paridade_compra",
+        "paridade_venda",
         "dat_process",
     ]
-    rows = list(fact_exchange_rates_df[cols].itertuples(index=False, name=None))
 
-    postgres_hook = PostgresHook(postgres_conn_id="postgres_astro", schema="astro")
+    tmp_path = "/tmp/fact_exchange_rates_load.csv"
+    df[cols].to_csv(tmp_path, index=False, header=False)
+    postgres_hook = PostgresHook(postgres_conn_id="postgres_astro")
 
-    postgres_hook.insert_rows(
-        table=table_name,
-        rows=rows,
-        target_fields=[
-            "dt_fechamento",
-            "cod_moeda",
-            "tipo_moeda",
-            "desc_moeda",
-            "taxa_compra",
-            "taxa_venda",
-            "paridade_compra",
-            "paridade_venda",
-            "dat_process",
-        ],
-        commit_every=1000,
-    )
+    copy_sql = """
+    copy public.fact_exchange_rates
+        (dt_fechamento, cod_moeda, tipo_moeda, desc_moeda,
+         taxa_compra, taxa_venda, paridade_compra,
+         paridade_venda, dat_process)
+        FROM STDIN WITH (FORMAT CSV)
+    """
+
+    postgres_hook.copy_expert(sql=copy_sql, filename=tmp_path)
+
+    try:
+        os.remove(tmp_path)
+    except OSError:
+        pass
 
 
 load_task = PythonOperator(task_id="load", python_callable=load, dag=dag)
